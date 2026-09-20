@@ -30,7 +30,6 @@ Panel {
     { id: "today", label: "Today" },
     { id: "week", label: "7 Days" },
     { id: "30days", label: "30 Days" },
-    { id: "month", label: "Month" },
     { id: "all", label: "6 Months" },
     { id: "lifetime", label: "Lifetime" }
   ]
@@ -69,6 +68,21 @@ Panel {
   property double lastUpdatedMs: 0
   property double nowMs: Date.now()
 
+  // --- Local balance & link config (persisted to config.json) ---
+  readonly property string configFilePath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/codeburn/config.json"
+  property real prepaidAmount: 0
+  property string billingUrl: "https://opencode.ai/auth"
+  property string overviewUrl: "https://opencode.ai/auth"
+  property bool configLoaded: false
+  property bool editingBalance: false
+  property bool balanceLoaded: false
+  property real lifetimeCost: 0
+  readonly property real remainingBalance: prepaidAmount - lifetimeCost
+  readonly property real balanceSpentRatio: prepaidAmount > 0 ? Math.max(0, Math.min(1, lifetimeCost / prepaidAmount)) : 0
+  readonly property bool showBalance: configLoaded && prepaidAmount > 0
+  readonly property bool lowBalance: showBalance && balanceLoaded && remainingBalance <= Math.max(0.01, prepaidAmount * 0.10)
+  readonly property bool overBudget: showBalance && balanceLoaded && remainingBalance < 0
+
   // --- Data Accessors ---
   readonly property var current: statusData ? statusData.current : null
   readonly property real cost: current && current.cost !== undefined ? Number(current.cost) : 0
@@ -88,9 +102,14 @@ Panel {
   readonly property bool isOnline: !hasError && statusData !== null
   readonly property string barCostText: isOnline ? formatCost(cost) : "--"
   readonly property string barStatusText: "󰈸 " + barCostText
+  readonly property string balanceTooltipLine: showBalance
+    ? (balanceLoaded
+      ? " · Balance: " + formatCost(remainingBalance) + (overBudget ? " (over)" : (lowBalance ? " (low)" : ""))
+      : " · Balance: loading…")
+    : ""
   readonly property string barTooltipText: isOnline
-    ? "CodeBurn (" + selectedPeriodLabel + "): " + formatCost(cost) + " · " + calls + " calls · " + sessions + " sessions (right-click to refresh)"
-    : "CodeBurn: status unavailable (right-click to refresh)"
+    ? "CodeBurn (" + selectedPeriodLabel + "): " + formatCost(cost) + " · " + calls + " calls · " + sessions + " sessions" + balanceTooltipLine + " (right-click to launch OpenCode)"
+    : "CodeBurn: status unavailable (right-click to launch OpenCode)"
 
   visible: true
   implicitWidth: button.implicitWidth
@@ -146,6 +165,10 @@ Panel {
           errorMessage = ""
           lastUpdatedMs = Date.now()
           nowMs = Date.now()
+          if (root.selectedPeriod === "lifetime" && parsed.current && parsed.current.cost !== undefined) {
+            root.lifetimeCost = Number(parsed.current.cost)
+            root.balanceLoaded = true
+          }
         }
       } else {
         hasError = true
@@ -162,6 +185,68 @@ Panel {
     if (statusProcess.running) return
     refreshing = true
     statusProcess.running = true
+    startBalanceQuery()
+  }
+
+  function applyConfig(raw) {
+    var cfg = {}
+    try {
+      var parsed = JSON.parse(String(raw || "") || "{}")
+      if (parsed && typeof parsed === "object") cfg = parsed
+    } catch (e) { /* keep defaults */ }
+    prepaidAmount = Math.max(0, Number(cfg.prepaid_amount) || 0)
+    billingUrl = String(cfg.billing_url || "https://opencode.ai/auth")
+    overviewUrl = String(cfg.overview_url || "https://opencode.ai/auth")
+    configLoaded = true
+    startBalanceQuery()
+  }
+
+  function saveConfig() {
+    var payload = {
+      "prepaid_amount": prepaidAmount,
+      "billing_url": billingUrl,
+      "overview_url": overviewUrl
+    }
+    configFile.setText(JSON.stringify(payload, null, 2))
+  }
+
+  function parseBalanceStatus(raw) {
+    try {
+      var parsed = JSON.parse(String(raw || "").trim())
+      if (parsed && parsed.current && parsed.current.cost !== undefined) {
+        lifetimeCost = Number(parsed.current.cost)
+        balanceLoaded = true
+      }
+    } catch (e) { /* keep previous lifetime value */ }
+  }
+
+  function startBalanceQuery() {
+    if (showBalance && !balanceProcess.running) balanceProcess.running = true
+  }
+
+  function setPrepaidAmount(value) {
+    var n = Number(value)
+    if (!isFinite(n) || n < 0) n = 0
+    prepaidAmount = n
+    saveConfig()
+  }
+
+  function commitBalance() {
+    setPrepaidAmount(balanceInput.text)
+    editingBalance = false
+  }
+
+  function openUrl(url) {
+    var target = String(url || "").trim()
+    if (target.length === 0) return
+    if (target.indexOf("http://") !== 0 && target.indexOf("https://") !== 0) {
+      target = "https://" + target
+    }
+    if (typeof Qt !== "undefined" && Qt.openUrlExternally) {
+      Qt.openUrlExternally(target)
+    } else {
+      Util.execDetached("xdg-open " + Util.shellQuote(target))
+    }
   }
 
   onOpenedChanged: if (opened) {
@@ -203,6 +288,34 @@ Panel {
     }
   }
 
+  FileView {
+    id: configFile
+    path: root.configFilePath
+    atomicWrites: true
+    onLoaded: root.applyConfig(configFile.text())
+    onLoadFailed: root.applyConfig("")
+  }
+
+  Process {
+    id: balanceProcess
+    command: [root.statusCommand, "lifetime"]
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.parseBalanceStatus(text)
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim().length > 0) {
+          console.warn("codeburn balance stderr:", text.trim())
+        }
+      }
+    }
+  }
+
   Timer {
     id: pollTimer
     interval: root.refreshIntervalSec * 1000
@@ -238,14 +351,14 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.barStatusText
-    active: root.isOnline && root.cost > 0
-    activeColor: root.accentColor
+    active: root.lowBalance || (root.isOnline && root.cost > 0)
+    activeColor: root.lowBalance ? root.urgent : root.accentColor
     fontSize: Style.font.bodySmall
     horizontalMargin: 4
     tooltipText: root.barTooltipText
 
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.refresh()
+      if (buttonCode === Qt.RightButton) Util.execDetached("xdg-terminal-exec opencode")
       else root.toggle()
     }
   }
@@ -282,9 +395,8 @@ Panel {
         else if (text === "1") root.selectPeriod("today")
         else if (text === "2") root.selectPeriod("week")
         else if (text === "3") root.selectPeriod("30days")
-        else if (text === "4") root.selectPeriod("month")
-        else if (text === "5") root.selectPeriod("all")
-        else if (text === "6") root.selectPeriod("lifetime")
+        else if (text === "4") root.selectPeriod("all")
+        else if (text === "5") root.selectPeriod("lifetime")
         else if (text === "]" || text === "p") root.cyclePeriod(1)
         else if (text === "[" || text === "P") root.cyclePeriod(-1)
       }
@@ -545,6 +657,219 @@ Panel {
             }
           }
 
+          // ---------------------------------------------------------- BALANCE
+          PanelSeparator {
+            visible: root.configLoaded
+            foreground: root.foreground
+          }
+
+          Column {
+            visible: root.configLoaded
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "PREPAID BALANCE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            BorderSurface {
+              width: parent.width
+              implicitHeight: balanceContent.implicitHeight + Style.space(14)
+              radius: Style.cornerRadius
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
+              borderSpec: Border.none()
+
+              Column {
+                id: balanceContent
+                anchors.centerIn: parent
+                width: parent.width - Style.space(24)
+                spacing: Style.space(6)
+
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(balanceStatusRow.implicitHeight, balanceEditBtn.implicitHeight)
+
+                  Row {
+                    id: balanceStatusRow
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(8)
+
+                    Text {
+                      visible: root.showBalance
+                      text: "󰬉"
+                      color: root.overBudget || root.lowBalance ? root.urgent : root.accentColor
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.subtitle
+                    }
+
+                    Text {
+                      visible: root.showBalance
+                      text: root.balanceLoaded ? root.formatCost(root.remainingBalance) : "—"
+                      color: root.overBudget || root.lowBalance ? root.urgent : root.accentColor
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.subtitle
+                      font.bold: true
+                    }
+
+                    Text {
+                      visible: root.showBalance
+                      text: root.overBudget ? "over budget" : (root.lowBalance ? "low balance" : "remaining")
+                      color: root.overBudget || root.lowBalance ? root.urgent : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      visible: !root.showBalance
+                      text: "No prepaid balance set"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.subtitle
+                      font.bold: true
+                    }
+                  }
+
+                  PanelActionButton {
+                    id: balanceEditBtn
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: root.editingBalance ? "󰜺" : "󰑠"
+                    tooltipText: root.editingBalance ? "Cancel" : "Update prepaid balance"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.editingBalance = !root.editingBalance
+                  }
+                }
+
+                Row {
+                  visible: root.showBalance
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Text {
+                    text: "Prepaid " + root.formatCost(root.prepaidAmount)
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    text: "·"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    text: "Spent " + (root.balanceLoaded ? root.formatCost(root.lifetimeCost) : "—")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Rectangle {
+                  visible: root.showBalance
+                  width: parent.width
+                  height: Style.space(4)
+                  radius: Style.cornerRadius
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+
+                  Rectangle {
+                    width: Math.max(0, parent.width * root.balanceSpentRatio)
+                    height: parent.height
+                    radius: Style.cornerRadius
+                    color: root.overBudget || root.lowBalance ? root.urgent : root.accentColor
+                    opacity: 0.85
+                  }
+                }
+
+                Item {
+                  visible: root.editingBalance
+                  width: parent.width
+                  implicitHeight: balanceInput.implicitHeight
+
+                  TextField {
+                    id: balanceInput
+                    anchors.left: parent.left
+                    anchors.right: balanceSaveBtn.left
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    placeholderText: "Prepaid amount (e.g. 25)"
+                    inputMethodHints: Qt.ImhFormattedNumbersOnly
+                    foreground: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    text: root.prepaidAmount > 0 ? root.prepaidAmount.toString() : ""
+                    onAccepted: root.commitBalance()
+                    Keys.onEscapePressed: root.editingBalance = false
+                    onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+                  }
+
+                  PanelActionButton {
+                    id: balanceSaveBtn
+                    anchors.right: balanceCancelBtn.left
+                    anchors.rightMargin: Style.space(4)
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: "󰄬"
+                    tooltipText: "Save"
+                    foreground: root.accentColor
+                    onClicked: root.commitBalance()
+                  }
+
+                  PanelActionButton {
+                    id: balanceCancelBtn
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: "󰜺"
+                    tooltipText: "Cancel"
+                    foreground: root.foreground
+                    onClicked: root.editingBalance = false
+                  }
+                }
+              }
+            }
+          }
+
+          // ------------------------------------------------------- QUICK LINKS
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "QUICK LINKS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              QuickLink {
+                width: (parent.width - parent.spacing) / 2
+                iconText: "󰀹"
+                label: "OpenCode Overview"
+                url: root.overviewUrl
+              }
+
+              QuickLink {
+                width: (parent.width - parent.spacing) / 2
+                iconText: "󰳯"
+                label: "Billing / Recharge"
+                url: root.billingUrl
+              }
+            }
+          }
+
           // ---------------------------------------------------------- PROVIDERS
           PanelSeparator {
             visible: root.isOnline && root.providerDetails.length > 0
@@ -746,6 +1071,60 @@ Panel {
   }
 
   // ------------------------------------------------------- SUBCOMPONENTS
+  component QuickLink: BorderSurface {
+    id: qlink
+    property string label: ""
+    property string iconText: ""
+    property string url: ""
+
+    implicitHeight: qlinkRow.implicitHeight + Style.space(12)
+    radius: Style.cornerRadius
+
+    readonly property bool hot: qlinkMouse.containsMouse
+
+    color: qlink.hot
+      ? Style.hoverFillFor(root.foreground, root.foreground)
+      : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.03)
+    borderSpec: Border.controlSpec("normal", root.foreground, root.accentColor)
+
+    Behavior on color { ColorAnimation { duration: 60 } }
+
+    Row {
+      id: qlinkRow
+      anchors.centerIn: parent
+      spacing: Style.space(8)
+
+      Text {
+        text: qlink.iconText
+        color: root.accentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        text: qlink.label
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+      }
+    }
+
+    MouseArea {
+      id: qlinkMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.openUrl(qlink.url)
+    }
+
+    PanelToolTip {
+      visible: qlinkMouse.containsMouse && qlink.url !== ""
+      text: qlink.url
+      fontFamily: root.fontFamily
+    }
+  }
+
   component SummaryCell: Rectangle {
     id: cellRoot
     property string label: ""

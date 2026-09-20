@@ -18,3 +18,6 @@ package-lock.json
 *.tmp
 *.bak
 .cache/
+
+# Local runtime config (prepaid balance, link URLs)
+config.json
